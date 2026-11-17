@@ -1,0 +1,718 @@
+OPERATING SYSTEMS
+ASSIGNMENT 2 – CO2
+Process Management, CPU Scheduling,
+Threads, IPC, Synchronisation and Deadlocks
+
+
+STUDENT DETAILS	
+Name	A. Siva Shankar
+Register Number	192573026
+Department	CSE DS
+Course Code	CSA0417 – Operating Systems
+Assignment	Assignment 2 – CO2
+GitHub Repository	To be added after creating the required repository
+
+
+Submitted to: Department of Computer Science and Engineering
+
+Savita Engineering College
+SIMATS
+
+Submission Note and Scope
+This report answers all six questions in the supplied CO2 assignment. It includes the requested diagrams, design decisions, calculations, completed code examples and evaluation.
+Important execution note: The assignment requires each student to compile and execute every program, capture terminal evidence, measure timings on their own machine and submit a GitHub repository. The code and analytical results below are prepared for the report, but machine-specific timings and screenshots must be replaced with your actual run results. Do not claim an illustrative timing as a measurement.
+
+Contents
+⦁	Q1 – Processes and Process States
+⦁	Q2 – CPU Scheduling
+⦁	Q3 – Threads
+⦁	Q4 – Inter-Process Communication
+⦁	Q5 – Synchronisation: Critical Sections, Semaphores and Monitors
+⦁	Q6 – Deadlock Handling and Banker’s Algorithm
+⦁	Final Conclusion and Submission Checklist
+Q1 – Processes and Process States
+Problem context: An online examination server creates student sessions, auto-save work and proctoring tasks. With 2,000 students logging in together, excessive process creation, memory use, context switching and I/O waiting can reduce performance.
+1.1 Process-state diagram
+          admitted                 dispatch
++-----+ -------------> +-------+ -------------> +---------+
+| NEW |                | READY |                | RUNNING |
++-----+                +-------+ <------------- +---------+
+                           ^       pre-emption       |   |
+                           |                         |   | exit
+              I/O complete|                         |   v
+                      +---------+ <--- I/O wait ---+---------+
+                      | WAITING |                  |TERMINATED|
+                      +---------+                  +---------+
+
+A process is NEW when it is being created. READY means it is in memory and waiting for CPU time. RUNNING means its instructions are executing. WAITING (blocked) means it is waiting for an event such as disk, network or keyboard I/O. TERMINATED means execution has ended.
+Transition	Meaning
+New → Ready	The operating system admits the process.
+Ready → Running	The CPU scheduler dispatches the process.
+Running → Ready	The time slice expires or a higher-priority process pre-empts it.
+Running → Waiting	The process requests I/O or waits for an event.
+Waiting → Ready	The required I/O/event completes.
+Running → Terminated	The process exits or is stopped.
+
+1.2 Process Control Block (PCB)
++----------------------------------+
+|       PROCESS CONTROL BLOCK      |
++----------------------------------+
+| Process ID (PID)                 |
+| Process state                    |
+| Program counter                  |
+| CPU registers / stack pointer    |
+| CPU scheduling information       |
+| Memory-management information    |
+| Accounting information           |
+| I/O status and open-file details |
+| Parent/child and signal details  |
++----------------------------------+
+
+The PCB is the kernel data structure that stores the information needed to manage and resume a process. During a context switch, the OS saves the running process's CPU state in its PCB and restores the next process's state.
+1.3 C program using fork(), ps and /proc
+The following Linux/POSIX program creates a child. The parent and child print their PIDs. A short sleep keeps the child visible long enough to inspect it.
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+ 
+int main(void) {
+    pid_t pid = fork();
+ 
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0) {
+        printf("Child: PID=%ld, PPID=%ld\n",
+               (long)getpid(), (long)getppid());
+        sleep(15);
+        printf("Child exiting\n");
+        _exit(0);
+    }
+ 
+    printf("Parent: PID=%ld, child PID=%ld\n",
+           (long)getpid(), (long)pid);
+    printf("Inspect the child using: ps -o pid,ppid,stat,cmd -p %ld\n",
+           (long)pid);
+    waitpid(pid, NULL, 0);
+    printf("Parent: child completed\n");
+    return 0;
+}
+
+Compile and run on Linux:
+gcc -std=c11 -Wall -Wextra fork_demo.c -o fork_demo
+./fork_demo
+ps -o pid,ppid,stat,cmd -p <child_PID>
+ls -l /proc/<child_PID>
+cat /proc/<child_PID>/status
+
+Expected observation: ps displays the child PID, parent PID and process state. /proc/<PID>/status provides process details such as name, state, PID, PPID and memory information. The exact PID and state vary on each run.
+1.4 Performance evaluation for 2,000 sessions
+Factor	Effect at high process count	Evaluation
+Context switching	CPU time is spent saving/restoring registers, memory mappings and scheduler state.	Frequent switching reduces useful application work.
+Memory	Each process has its own virtual address space, page tables and kernel bookkeeping.	2,000 independent address spaces can consume substantially more memory.
+I/O waiting	Network, disk and video operations can leave many processes blocked.	Blocked processes do not use CPU, but still occupy resources.
+Scheduling	A large runnable queue increases scheduling and cache pressure.	Latency can rise, especially when jobs are short.
+
+1.5 Design decision
+Design	Advantages	Disadvantages
+One process per student	Strong isolation; one crash normally does not crash other sessions.	Higher memory and process-management overhead; IPC is needed.
+One thread per student	Lower creation and switching overhead; shared memory makes communication easy.	A faulty thread can damage the whole server; shared data needs locks.
+Fixed worker pool	Limits concurrency; predictable resource use; queue absorbs bursts.	A queue can build up if pool is too small; needs load balancing.
+
+Recommendation: Use a fixed-size worker-thread pool for ordinary request processing, with separate processes only for risky or strongly isolated components such as video decoding. A bounded request queue prevents unlimited worker creation. This balances memory, throughput and fault isolation better than creating one full process for every student.
+1.6 Alternative: one thread per student
+Threads in the same process share code, global data, heap and open file descriptors. Each thread has its own stack, registers, program counter and thread-local storage. A thread generally needs much less memory than a separate process, although stack size depends on the platform and configuration. Thread switches can be cheaper because the address space is shared, but they still require scheduler and register-state work.
+A thread crash caused by an invalid memory write can terminate or corrupt the entire server process. A process-per-session design offers stronger isolation. Therefore, a bounded thread pool is preferred for normal sessions, while process isolation should be used where a crash must not affect the main service.
+1.7 Complexity and conclusion
+Creating and tracking N independent processes requires O(N) process records and at least O(N) total per-process bookkeeping; a thread pool with K workers uses O(K) worker stacks plus O(N) queued request records. Processing each request still depends on the request workload. Since K is bounded and normally much smaller than N, the pool controls memory and scheduling overhead. The server should use admission control, asynchronous I/O and monitoring to prevent overload.
+Q2 – CPU Scheduling
+Given processes: P1(Arrival 0, Burst 8), P2(1,4), P3(2,9), P4(3,5). Lower waiting time improves customer experience, while response time is especially important for short thumbnail jobs.
+Process	Arrival time	Burst time
+P1	0	8
+P2	1	4
+P3	2	9
+P4	3	5
+
+Definitions: Turnaround time (TAT) = Completion time − Arrival time. Waiting time (WT) = TAT − Burst time. Response time = First CPU start time − Arrival time.
+2.1 FCFS scheduling
+First Come First Served executes jobs in arrival order and is non-preemptive.
+Gantt: |   P1   | P2 |   P3   | P4 |
+Time:   0        8   12       21   26
+
+Process	Completion	TAT	WT	Response
+P1	8	8	0	0
+P2	12	11	7	7
+P3	21	19	10	10
+P4	26	23	18	18
+Average	—	15.25	8.75	8.75
+
+FCFS is simple, but a long film can make short thumbnail jobs wait (convoy effect).
+2.2 SJF (non-preemptive)
+After P1 completes at time 8, the available jobs are P2, P3 and P4. SJF selects the shortest burst: P2, then P4, then P3.
+Gantt: |   P1   | P2 | P4 |   P3   |
+Time:   0        8   12   17       26
+
+Process	Completion	TAT	WT	Response
+P1	8	8	0	0
+P2	12	11	7	7
+P4	17	14	9	9
+P3	26	24	15	15
+Average	—	14.25	7.75	7.75
+
+SJF gives a low average waiting time when burst lengths are known, but long jobs can starve if short jobs keep arriving.
+2.3 SRTF (preemptive SJF)
+SRTF always selects the ready process with the smallest remaining CPU burst. P1 starts at 0, but P2 arrives at 1 with a shorter burst and pre-empts it. P4 then becomes the shortest remaining job at time 5.
+Gantt: |P1|    P2    |    P4    |   P1   |     P3     |
+Time:   0 1           5          10       17           26
+
+Process	Completion	TAT	WT	Response
+P1	17	17	9	0
+P2	5	4	0	0
+P4	10	7	2	2
+P3	26	24	15	15
+Average	—	13.00	6.50	4.25
+
+SRTF provides fast response for short jobs, but requires remaining-burst estimates and can starve long jobs.
+2.4 Priority scheduling (assumption stated)
+The assignment does not provide priority values. For a reproducible comparison, this report assumes non-preemptive priorities with lower number meaning higher priority: P1=3, P2=1, P3=4, P4=2. At time 0 only P1 is ready, so it runs first. At time 8, P2, P3 and P4 are ready; the order is P2, P4, P3.
+Gantt: |   P1   | P2 | P4 |   P3   |
+Time:   0        8   12   17       26
+
+Process	Completion	TAT	WT	Response
+P1	8	8	0	0
+P2	12	11	7	7
+P4	17	14	9	9
+P3	26	24	15	15
+Average	—	14.25	7.75	7.75
+
+Priority scheduling is useful when service classes matter, but low-priority work may starve. Ageing gradually increases the priority of jobs that wait for a long time.
+2.5 Round Robin (quantum = 3)
+Round Robin gives each ready process up to three time units, then places an unfinished process at the back of the ready queue.
+Gantt: P1(0-3) P2(3-6) P3(6-9) P4(9-12) P1(12-15)
+       P2(15-16) P3(16-19) P4(19-21) P1(21-23) P3(23-26)
+
+Process	Completion	TAT	WT	Response
+P1	23	23	15	0
+P2	16	15	11	2
+P3	26	24	15	4
+P4	21	18	13	6
+Average	—	20.00	13.50	3.00
+
+The values match the assignment's expected output. RR has a higher average waiting time here than SRTF, but it gives each process an early opportunity to run.
+2.6 Completed Round Robin C program
+#include <stdio.h>
+#define N 4
+int main(void) {
+    const char *name[N] = {"P1","P2","P3","P4"};
+    int arrival[N] = {0,1,2,3}, burst[N] = {8,4,9,5}, quantum = 3;
+    int left[N], finish[N], queue[64], head=0, tail=0, added[N]={0};
+    for (int i=0;i<N;i++) left[i]=burst[i];
+    int time=0, done=0;
+    queue[tail++]=0; added[0]=1;
+    printf("Gantt:");
+    while (done<N) {
+        if (head==tail) {
+            for (int i=0;i<N;i++)
+                if (!added[i] && left[i]>0) {
+                    if (time<arrival[i]) time=arrival[i];
+                    queue[tail++]=i; added[i]=1; break;
+                }
+        }
+        int p=queue[head++];
+        int run = left[p] < quantum ? left[p] : quantum;
+        int old=time; time+=run; left[p]-=run;
+        printf(" %s(%d-%d)",name[p],old,time);
+        for (int i=0;i<N;i++)
+            if (!added[i] && arrival[i]<=time) {
+                queue[tail++]=i; added[i]=1;
+            }
+        if (left[p]>0) queue[tail++]=p;
+        else { finish[p]=time; done++; }
+    }
+    double tw=0,tt=0;
+    printf("\nProcess TAT WT\n");
+    for(int i=0;i<N;i++){
+        int tat=finish[i]-arrival[i], wt=tat-burst[i];
+        tt+=tat; tw+=wt;
+        printf("%-7s %4d %3d\n",name[i],tat,wt);
+    }
+    printf("Average TAT = %.2f, average WT = %.2f\n",tt/N,tw/N);
+    return 0;
+}
+
+Compile: gcc -std=c11 -Wall -Wextra rr.c -o rr && ./rr
+2.7 Quantum study
+Quantum	Average TAT	Average WT	Approx. slice boundaries	Evaluation
+1	19.0	12.5	25	Very responsive; many switches and scheduling overhead.
+3	20.0	13.5	9	Balanced; matches the supplied expected output.
+5	17.5	11.0	5	Fewer switches; short jobs still receive service.
+20	15.25	8.75	3	Behaves close to FCFS; long jobs can delay short jobs.
+
+The counts are the number of CPU slices minus one, excluding the initial dispatch; an OS may count context switches differently. The averages are calculated for the supplied four jobs using the stated arrival order and queue rule.
+2.8 Multilevel Feedback Queue (MLFQ) and recommendation
+An MLFQ places new jobs in a high-priority queue with a short quantum. A job that repeatedly uses its entire quantum is moved to a lower-priority queue with a longer quantum. Interactive and short jobs therefore receive quick service, while CPU-intensive long jobs still make progress. Periodic priority boosts or ageing prevent starvation.
+Recommendation: Use an MLFQ or a hybrid priority + Round Robin policy for the video service. It favours short thumbnail tasks and remains fair to long encoding jobs. The measured example shows SRTF has the lowest average waiting time, but real video burst lengths are not always known in advance. MLFQ is more practical when job length is uncertain.
+Complexity: A simple ready-queue insertion/removal can be O(1) with linked queues. SJF/SRTF selection can be O(n) by scanning n jobs, or O(log n) with a priority heap. MLFQ scheduling cost is small per queue operation, while its policy and tuning add complexity.
+Q3 – Threads
+A traffic-camera system receives frames from 64 cameras. Parallel processing can reduce total completion time, but speed-up is limited by CPU cores, memory bandwidth, I/O and synchronisation.
+3.1 Shared and private thread resources
+Shared by threads in one process	Private to each thread
+Code/text section	Thread ID and execution state
+Global and static variables	Program counter and CPU registers
+Heap and dynamically allocated objects	Own stack
+Open file descriptors	Thread-local storage
+Address space and process resources	Scheduling/priority state
+
+3.2 Thread implementation models
+Model	Mapping	Evaluation
+Many-to-one	Many user threads map to one kernel thread.	Fast user-level management, but one blocking call can block all; no true multicore parallelism.
+One-to-one	Each user thread maps to a kernel thread.	Supports parallelism; more kernel resources and scheduling overhead.
+Many-to-many	Many user threads are multiplexed over a set of kernel threads.	Flexible concurrency; implementation is more complex.
+
+User-level threads are managed by a user-space library and can be quick to create/switch. Kernel-level threads are known to the OS scheduler and can run simultaneously on multiple cores.
+3.3 POSIX thread program – camera worker pool
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+ 
+#define CAMERAS 64
+typedef struct { int first, last; long *counts; } Work;
+ 
+void *process_frames(void *arg) {
+    Work *w = (Work *)arg;
+    for (int c=w->first; c<w->last; ++c) {
+        /* Replace this loop with actual frame decoding/plate recognition. */
+        long detected = 0;
+        for (int f=0; f<100000; ++f)
+            detected += (f % 997 == 0);
+        w->counts[c] = detected;
+    }
+    return NULL;
+}
+ 
+int main(int argc, char **argv) {
+    int workers = argc > 1 ? atoi(argv[1]) : 4;
+    if (workers < 1 || workers > CAMERAS) return 1;
+    pthread_t *threads = calloc((size_t)workers, sizeof *threads);
+    Work *work = calloc((size_t)workers, sizeof *work);
+    long counts[CAMERAS] = {0};
+    int chunk = (CAMERAS + workers - 1) / workers;
+    for (int i=0; i<workers; ++i) {
+        work[i].first = i * chunk;
+        work[i].last = work[i].first + chunk;
+        if (work[i].last > CAMERAS) work[i].last = CAMERAS;
+        work[i].counts = counts;
+        pthread_create(&threads[i], NULL, process_frames, &work[i]);
+    }
+    for (int i=0; i<workers; ++i) pthread_join(threads[i], NULL);
+    long total=0;
+    for (int i=0; i<CAMERAS; ++i) total += counts[i];
+    printf("Workers=%d, cameras=%d, total detections=%ld\n",
+           workers, CAMERAS, total);
+    free(threads); free(work);
+    return 0;
+}
+
+Compile and run: gcc -std=c11 -Wall -Wextra -pthread camera_pool.c -o camera_pool; then run ./camera_pool 1, ./camera_pool 4, ./camera_pool 8 and ./camera_pool 16. Run several trials and record the average elapsed time.
+3.4 Speed-up measurement
+Worker count	Elapsed time (seconds)	Speed-up = T1/Tn
+1	Fill using your run	1.00
+4	Fill using your run	T1/T4
+8	Fill using your run	T1/T8
+16	Fill using your run	T1/T16
+
+No machine timings are supplied in the assignment PDF, so these cells must be filled from actual execution. Amdahl's law explains the limit: if fraction P is parallel and fraction (1−P) is serial, maximum speed-up with N workers is 1/((1−P)+P/N).
+3.5 Race condition and protection
+If two threads execute counter++ at the same time, both may read the same old value and write back the same incremented value. One update is lost. This is a race condition. Protect the update with a pthread mutex, or use a C11 atomic counter when only an atomic increment is required.
+pthread_mutex_lock(&counter_mutex);
+counter++;
+pthread_mutex_unlock(&counter_mutex);
+ 
+/* Alternative for a simple counter: */
+atomic_fetch_add(&atomic_counter, 1);
+
+3.6 Alternative: multiple processes
+Separate processes have independent address spaces, so a memory fault in one camera worker is less likely to corrupt another. However, process creation, context switching and memory use are generally higher. Results must be combined through pipes, sockets, message queues or shared memory. Threads are preferred when workers share large frame buffers; processes are useful when decoding libraries are unstable or strong fault isolation is required.
+For N frames, the useful processing work is O(N). A pool of K workers ideally reduces parallel processing time toward O(N/K), but actual speed-up is bounded by serial work, available CPU cores, memory bandwidth and I/O. A fixed pool of approximately the number of effective CPU cores is a good starting point.
+Q4 – Inter-Process Communication
+The weather station has a sensor-reader process and an analyser process. The communication method must preserve every reading and signal when the stream has ended.
+4.1 Pipe communication diagram
++----------------------+       pipe (kernel buffer)       +----------------------+
+| Parent: sensor reader|  write(reading)  ------------->  | Child: data analyser |
+|                      |                                  |                      |
+| close(write end)     |  EOF when all writers close      | read() returns 0     |
++----------------------+                                  +----------------------+
+
+4.2 Completed pipe program
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+ 
+int main(void) {
+    int fd[2];
+    if (pipe(fd) == -1) { perror("pipe"); return 1; }
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+ 
+    if (pid == 0) {
+        close(fd[1]);
+        int r, count=0, sum=0, max=0;
+        ssize_t n;
+        while ((n=read(fd[0], &r, sizeof r)) > 0) {
+            if (n != sizeof r) { fprintf(stderr,"partial reading\n"); exit(1); }
+            if (count==0 || r>max) max=r;
+            sum += r; count++;
+        }
+        if (n < 0) perror("read");
+        printf("analyser: %d readings, average %.1f, max %d\n",
+               count, count ? (double)sum/count : 0.0, max);
+        close(fd[0]); fflush(stdout); _exit(0);
+    }
+ 
+    close(fd[0]);
+    int readings[] = {31,33,36,34,41,38};
+    for (int i=0;i<6;i++)
+        if (write(fd[1], &readings[i], sizeof readings[i]) != sizeof readings[i])
+            perror("write");
+    close(fd[1]);
+    waitpid(pid,NULL,0);
+    printf("reader: done\n");
+    return 0;
+}
+
+Compile: gcc -std=c11 -Wall -Wextra pipe_weather.c -o pipe_weather && ./pipe_weather
+Expected output:
+analyser: 6 readings, average 35.5, max 41
+reader: done
+
+The parent must close fd[1] after writing. When every open write end is closed and the pipe buffer becomes empty, the child's read() returns 0 (EOF). If the parent forgets to close fd[1], the kernel still sees a writer open, so the child waits for more data and does not finish.
+4.3 Shared-memory alternative
+Shared memory maps the same memory region into both processes. It avoids copying every reading through a pipe after the shared region is established, but it requires explicit coordination. A producer/consumer design can use a POSIX shared-memory object plus two semaphores: one counting available slots and one counting available readings. A mutex protects the shared indices and buffer.
+Conceptual shared-memory producer/consumer:
+1. shm_open() and ftruncate() create a shared object.
+2. mmap() maps it into both processes.
+3. Initialise shared buffer, read/write indices and semaphores.
+4. Reader: wait(empty), lock, write item, unlock, post(full).
+5. Analyser: wait(full), lock, read item, unlock, post(empty).
+6. Send an explicit end-of-stream marker, then unmap and unlink.
+
+4.4 Comparison of IPC methods
+Method	Data movement	Synchronisation	Strength / limitation
+Pipe	Kernel buffer; data is copied between user and kernel space.	Usually read/write blocking is sufficient for a simple stream.	Simple, ordered byte stream; good for related processes.
+Message queue	Messages are transferred through kernel-managed queue storage.	Queue operations provide message boundaries; queue capacity must be handled.	Preserves message boundaries and priorities; kernel overhead.
+Shared memory	Processes access the same mapped region; no per-message kernel copy after setup.	Needs mutexes/semaphores and careful memory ordering.	High throughput for large data; coordination is more complex.
+
+4.5 Growth investigation and complexity
+For 1 MB, 10 MB and 100 MB, measure each method using the same machine, buffer size, number of repetitions and payload. Use a monotonic clock and report the average of at least five runs. The assignment provides no measured values, so the following table is for entering actual results:
+Payload	Pipe time	Message queue time	Shared-memory time
+1 MB	Record run	Record run	Record run
+10 MB	Record run	Record run	Record run
+100 MB	Record run	Record run	Record run
+
+Expected trend (not a measured result): shared memory is often fastest for large continuous payloads because it avoids repeated kernel-mediated copying. Pipes are simpler and often sufficient for modest streams. Message queues are useful when discrete message boundaries matter. For n bytes, transfer work is O(n) for all three methods; the constant overhead and copying differ.
+Q5 – Synchronisation: Critical Sections, Semaphores and Monitors
+In railway ticket booking, several agents may try to reserve the same seat. The shared seat state must be updated atomically to prevent duplicate sales.
+5.1 Critical-section requirements
+Requirement	Meaning in ticket booking
+Mutual exclusion	Only one agent at a time updates the same seat record.
+Progress	If the critical section is free and agents want to enter, selection of the next agent cannot be postponed indefinitely.
+Bounded waiting	An agent that requests entry must not be bypassed forever; a bound exists on the number of other entries before it gets a turn.
+
+5.2 Peterson’s solution
+For two processes P0 and P1, Peterson’s algorithm uses flag[2] to show interest and turn to resolve simultaneous requests.
+Shared: bool flag[2] = {false,false}; int turn;
+Process i (j = 1-i):
+    flag[i] = true;
+    turn = j;
+    while (flag[j] && turn == j) { }   // wait
+    critical_section();
+    flag[i] = false;
+    remainder_section();
+
+Mutual exclusion is maintained because when both processes want to enter, turn gives one priority. Progress is maintained because a process that is not interested cannot block the other. Bounded waiting is maintained because the turn variable prevents one process from repeatedly bypassing the other. On modern CPUs, compiler and hardware reordering can violate the assumptions of the textbook code unless suitable atomic operations and memory-order guarantees are used. It is mainly a teaching algorithm, not a replacement for OS mutexes.
+5.3 Binary and counting semaphores
+A binary semaphore has values 0 or 1 and can protect one critical section. A counting semaphore represents multiple identical available resources. wait (P) decrements the semaphore or blocks when no resource is available; signal (V) increments it and wakes a waiting thread if needed.
+sem_wait(&seat_lock);        // enter protected region
+if (seat_is_available(seat)) {
+    mark_seat_booked(seat);
+}
+sem_post(&seat_lock);        // leave protected region
+
+A single global binary semaphore is safe but can become a bottleneck. A lock per train or coach allows independent bookings to proceed concurrently, provided seat data is protected at the correct granularity.
+5.4 Classic synchronisation problems
+Bounded buffer (producer–consumer)
+Use empty=buffer capacity, full=0 and a mutex. A producer waits(empty), locks, inserts an item, unlocks and signals(full). A consumer waits(full), locks, removes an item, unlocks and signals(empty).
+Readers–writers
+A reader count is protected by a mutex. The first reader locks the shared data resource; the last reader unlocks it. Writers lock the shared resource exclusively. A reader-preference version can starve writers, so a fair read-write lock or turnstile is preferred when bounded waiting is required.
+Dining philosophers
+Each philosopher needs two forks. Taking one fork and waiting indefinitely for the other can create circular wait. A common semaphore solution allows at most four of five philosophers to compete at once, or uses a waiter that grants both forks together. Resource ordering (always acquire the lower-numbered fork first) also prevents circular wait.
+5.5 Monitor and condition variables
+A monitor encapsulates shared data and operations so only one thread executes a monitor procedure at a time. Condition variables allow a thread to wait until a condition becomes true. For a ticket system, a bookSeat() monitor operation can check availability and mark the seat booked atomically. This reduces the chance of forgetting a lock or releasing it in the wrong place.
+5.6 Completed semaphore bounded-buffer program
+This version supports four producers and four consumers while ensuring exactly 20 distinct items are produced and consumed once. It uses a shared next-item counter protected by the mutex, plus empty/full semaphores.
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <pthread.h>
+#include <semaphore.h>
+ 
+#define SIZE 5
+#define ITEMS 20
+#define PRODUCERS 4
+#define CONSUMERS 4
+ 
+int buffer[SIZE], in=0, out=0, next_item=1;
+sem_t empty, full;
+pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+long consumed_sum=0;
+int consumed_count=0;
+ 
+void *producer(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&lock);
+        int item=next_item++;
+        pthread_mutex_unlock(&lock);
+        if (item>ITEMS) break;
+ 
+        sem_wait(&empty);
+        pthread_mutex_lock(&lock);
+        buffer[in]=item;
+        in=(in+1)%SIZE;
+        pthread_mutex_unlock(&lock);
+        sem_post(&full);
+    }
+    return NULL;
+}
+void *consumer(void *arg) {
+    (void)arg;
+    for (;;) {
+        sem_wait(&full);
+        pthread_mutex_lock(&lock);
+        int item=buffer[out];
+        out=(out+1)%SIZE;
+        pthread_mutex_unlock(&lock);
+        sem_post(&empty);
+ 
+        if (item==-1) break;
+        pthread_mutex_lock(&lock);
+        consumed_sum+=item;
+        consumed_count++;
+        pthread_mutex_unlock(&lock);
+    }
+    return NULL;
+}
+int main(void) {
+    pthread_t p[PRODUCERS], c[CONSUMERS];
+    sem_init(&empty,0,SIZE); sem_init(&full,0,0);
+    for(int i=0;i<CONSUMERS;i++)
+        pthread_create(&c[i],NULL,consumer,NULL);
+    for(int i=0;i<PRODUCERS;i++)
+        pthread_create(&p[i],NULL,producer,NULL);
+    for(int i=0;i<PRODUCERS;i++) pthread_join(p[i],NULL);
+ 
+    /* One stop marker for each consumer. */
+    for(int i=0;i<CONSUMERS;i++) {
+        sem_wait(&empty);
+        pthread_mutex_lock(&lock);
+        buffer[in]=-1; in=(in+1)%SIZE;
+        pthread_mutex_unlock(&lock);
+        sem_post(&full);
+    }
+    for(int i=0;i<CONSUMERS;i++) pthread_join(c[i],NULL);
+ 
+    printf("items consumed: %d, sum = %ld (expected %d)\n",
+           consumed_count,consumed_sum,ITEMS*(ITEMS+1)/2);
+    sem_destroy(&empty); sem_destroy(&full);
+    pthread_mutex_destroy(&lock);
+    return 0;
+}
+
+Compile: gcc -std=c11 -Wall -Wextra -pthread bounded_buffer.c -o bounded_buffer && ./bounded_buffer
+Expected result: items consumed: 20, sum = 210 (expected 210). The order of consumption may vary. Run it 100 times in a shell loop and confirm every run reports 20 items and sum 210.
+for i in $(seq 1 100); do ./bounded_buffer; done
+
+The original assignment starter program has one producer and one consumer. The extended version above adds multiple producers/consumers and a unique item allocator. The mutex is needed for the shared buffer indices, item allocation and result counters.
+5.7 What happens without the mutex?
+Without the mutex, two producers may write to the same buffer position or update the circular index concurrently. Two consumers may read the same slot or corrupt the output index. Updates to consumed_sum and consumed_count may also be lost. The semaphores control the number of full and empty slots, but they do not automatically make multiple shared-variable operations atomic.
+5.8 Lock granularity and deployment decision
+Lock strategy	Advantages	Disadvantages
+One global lock	Simple; easy to reason about.	All bookings serialize; poor throughput.
+One lock per train	Different trains can be booked concurrently.	Bookings on the same train still serialize.
+One lock per coach/seat group	High concurrency for unrelated seats.	More locks; lock ordering and multi-seat booking become harder.
+
+Recommendation: Use one lock per train as the safe starting point, then measure contention. If each coach has independent seat inventory and reservations rarely span coaches, use per-coach locks. Multi-seat or cross-coach bookings must acquire locks in a fixed order to prevent deadlock. No throughput figures are supplied; benchmark all three strategies with the same workload before claiming a measured winner.
+5.9 Atomic operations and spin locks
+C11 atomic_fetch_add can update a simple counter without a mutex and is appropriate when the operation is a single atomic update. A spin lock repeatedly checks a lock variable; it may be efficient for extremely short critical sections on multiprocessor systems, but wastes CPU while waiting. A blocking mutex/semaphore is usually better for long critical sections or oversubscribed workloads.
+Complexity: A protected counter update is O(1) per operation. A spin lock may use O(k) repeated checks while waiting k iterations. A mutex can block a waiting thread rather than consume CPU continuously. At 1, 4 and 16 threads, record throughput and CPU utilisation on the actual system; contention usually increases as thread count rises.
+Q6 – Deadlock Handling and Banker’s Algorithm
+The research centre shares GPUs, simulation licences and high-speed storage among jobs. A deadlock occurs when a set of processes is permanently blocked because each waits for a resource held by another.
+6A.1 Four necessary conditions
+Condition	Meaning in the cluster	Example
+Mutual exclusion	At least one resource is non-shareable.	A GPU allocation is assigned exclusively to one job.
+Hold and wait	A job holds one resource while requesting another.	A job holds a GPU and waits for a licence.
+No pre-emption	Resources cannot be forcibly taken away safely.	A running simulation cannot release its GPU immediately.
+Circular wait	A circular chain of jobs waits for resources held by the next job.	J1 waits for J2, J2 waits for J3, J3 waits for J1.
+
+6A.2 Resource-allocation graph
+     requests                         allocated
+ J1 ---------> GPU <--------------------- J2
+ ^                                      |
+ |                                      | requests
+ |                                      v
+ |                                    LICENCE
+ |                                      |
+ |                                      v allocated
+STORAGE <----------------------------- J3
+  ^                                      |
+  |                                      | requests
+  +--------------------------------------+
+
+In a resource-allocation graph, process/job nodes are circles and resource-type nodes are rectangles. A request edge points from a process to a resource; an assignment edge points from a resource instance to the process holding it. The cycle above illustrates circular wait. A cycle is necessary for deadlock in a single-instance resource system; with multiple instances, a cycle alone may not prove deadlock.
+6A.3 Completed Banker’s algorithm program
+#include <stdio.h>
+#include <string.h>
+#define P 5
+#define R 3
+ 
+int avail[R]={3,3,2};
+int maxm[P][R]={{7,5,3},{3,2,2},{9,0,2},{2,2,2},{4,3,3}};
+int alloc[P][R]={{0,1,0},{2,0,0},{3,0,2},{2,1,1},{0,0,2}};
+ 
+int is_safe(int seq[P]) {
+    int work[R], finish[P]={0}, count=0;
+    memcpy(work,avail,sizeof work);
+    while(count<P) {
+        int found=0;
+        for(int p=0;p<P;p++) {
+            if(finish[p]) continue;
+            int possible=1;
+            for(int r=0;r<R;r++)
+                if(maxm[p][r]-alloc[p][r] > work[r]) possible=0;
+            if(possible) {
+                for(int r=0;r<R;r++) work[r]+=alloc[p][r];
+                finish[p]=1;
+                seq[count++]=p;
+                found=1;
+            }
+        }
+        if(!found) return 0;
+    }
+    return 1;
+}
+void request(int p,const int req[R]) {
+    for(int r=0;r<R;r++)
+        if(req[r]>maxm[p][r]-alloc[p][r] || req[r]>avail[r]) {
+            printf("P%d request: must wait (not available)\n",p);
+            return;
+        }
+    for(int r=0;r<R;r++){avail[r]-=req[r];alloc[p][r]+=req[r];}
+    int seq[P];
+    if(is_safe(seq)) {
+        printf("P%d request: granted, safe sequence",p);
+        for(int i=0;i<P;i++) printf(" P%d",seq[i]);
+        printf("\n");
+    } else {
+        for(int r=0;r<R;r++){avail[r]+=req[r];alloc[p][r]-=req[r];}
+        printf("P%d request: denied (unsafe)\n",p);
+    }
+}
+int main(void) {
+    int seq[P];
+    if(is_safe(seq)) {
+        printf("initial state safe:");
+        for(int i=0;i<P;i++) printf(" P%d",seq[i]);
+        printf("\n");
+    } else printf("initial state unsafe\n");
+    request(1,(int[R]){1,0,2});
+    request(4,(int[R]){3,3,0});
+    request(0,(int[R]){0,2,0});
+    return 0;
+}
+
+Compile: gcc -std=c11 -Wall -Wextra banker.c -o banker && ./banker
+Expected output:
+initial state safe: P1 P3 P4 P0 P2
+P1 request: granted, safe sequence P1 P3 P4 P0 P2
+P4 request: must wait (not available)
+P0 request: denied (unsafe)
+
+6A.4 Need and initial safe sequence
+Process	Allocation (A,B,C)	Maximum (A,B,C)	Need = Max − Allocation
+P0	0,1,0	7,5,3	7,4,3
+P1	2,0,0	3,2,2	1,2,2
+P2	3,0,2	9,0,2	6,0,0
+P3	2,1,1	2,2,2	0,1,1
+P4	0,0,2	4,3,3	4,3,1
+
+Available = (3,3,2). P1 can finish because its need (1,2,2) is no greater than available; after it finishes, its allocation is released. Repeating the test gives the safe order P1 → P3 → P4 → P0 → P2. A safe sequence means every process can finish in that order if it requests no more than its declared maximum.
+6A.5 Why P0 request (0,2,0) is unsafe
+After P1's request is granted, the available vector becomes (2,3,0). P4's request (3,3,0) cannot be granted because only 2 units of resource A are available. Next P0 requests (0,2,0), leaving Available = (2,1,0). The new P0 allocation becomes (0,3,0), so its remaining Need is (7,2,3).
+With Available (2,1,0), P0 cannot finish because it needs (7,2,3); P1 cannot finish because it needs (0,2,0) after its earlier grant? It needs two units of B while only one is available; P2 needs six units of A; P3 needs one unit of B and one of C; P4 needs four units of A. No process can complete. Therefore the tentative request leads to an unsafe state and is rolled back.
+6B. Compare deadlock strategies
+Strategy	How it works	Advantages	Limitations for the cluster
+Prevention	Break at least one necessary condition, e.g. impose a global resource order.	Can guarantee deadlock cannot occur under the enforced rule.	May reduce utilisation and flexibility; difficult if jobs need resources dynamically.
+Avoidance	Grant a request only if the resulting state is safe (Banker’s algorithm).	Avoids entering unsafe states; useful when maximum needs are known.	Requires maximum demands in advance and safety check on requests.
+Detection and recovery	Allow deadlocks, periodically detect cycles/unsafe waits, then abort or roll back jobs.	Does not require advance maximum claims; flexible allocation.	Detection costs CPU; aborted simulations lose completed work.
+Ignore (ostrich)	Do nothing because deadlocks are considered sufficiently rare.	Very low operating overhead.	Unacceptable for critical shared laboratory resources if a cluster-wide stall is costly.
+
+6C. Banker’s algorithm request steps
+1.	Check that Request[i] is not greater than Need[i].
+2.	Check that Request[i] is not greater than Available. If not, the process must wait.
+3.	Temporarily allocate the requested resources and update Available, Allocation and Need.
+4.	Run the safety algorithm. If a safe sequence exists, keep the allocation; otherwise restore the old state and deny the request.
+6D. Predict complexity
+Let n be the number of processes and m the number of resource types. In the straightforward safety algorithm, at most n processes are selected. Each search may scan up to n processes and compare up to m resource values. The conservative worst-case time complexity is O(m × n²). The work and finish arrays require O(n + m) extra space, excluding the input matrices.
+6E. Measurement plan
+The assignment asks for measurements at 10, 100 and 1,000 processes. The supplied C example is fixed at five processes and three resource types, so it must be generalised to dynamically allocated arrays before this experiment. Generate valid maximum/allocated matrices and ensure the test has a known safe sequence. Use clock_gettime(CLOCK_MONOTONIC, ...) around repeated calls, run enough repetitions to overcome timer noise, and report the average.
+Processes (n)	Resource types (m)	Predicted growth	Measured average time
+10	3	Proportional to m·10²	Enter actual result
+100	3	About 100× the n² work of n=10	Enter actual result
+1,000	3	About 100× the n² work of n=100	Enter actual result
+
+Do not fill the measurement column with invented numbers. The assignment explicitly expects your own measured times. The O(mn²) prediction can be compared with the ratios from your actual benchmark.
+
+6F. Final design recommendation
+For a research cluster where maximum resource requirements can be declared reliably, Banker’s algorithm is a strong choice for scarce, high-value resources because it prevents unsafe allocations before a deadlock occurs. The resource manager should collect maximum GPU, licence and storage requirements at job submission, run the safety check before granting requests, and provide queueing/fairness controls.
+If jobs cannot predict their maximum requirements, use a hybrid design: enforce a resource ordering for common resources, use timeouts and deadlock detection for dynamic allocations, and recover by checkpointing or aborting the lowest-cost job. The final decision should consider the cost of a safety check, the cost of lost simulation work and whether maximum claims are trustworthy.
+Final Conclusion
+Process and thread design, suitable scheduling, reliable IPC, correct synchronisation and deadlock handling all contribute to better CPU utilisation and system performance. A bounded worker pool controls overload; MLFQ balances short and long jobs; shared memory is suitable for high-volume exchange when synchronisation is correct; fine-grained locks improve concurrency; and Banker’s algorithm avoids unsafe resource allocation when maximum demands are known.
+GitHub and execution checklist
+⦁	Create repository named CSA04-192573026-Assignment2.
+⦁	Create folders Task01 through Task06 (or Q1 through Q6).
+⦁	Add each C source file, README.md, compile/run commands, outputs and screenshots.
+⦁	Compile with warnings enabled; use -pthread for pthread programs.
+⦁	Run every program on Linux and replace illustrative/expected outputs with your actual terminal evidence.
+⦁	Measure Q3 speed-up, Q4 transfer times, Q5 throughput and Q6 execution times on your own machine.
+⦁	Commit progressively with at least one meaningful commit per task.
+⦁	Add the working GitHub repository URL to the cover page and the assignment submission.
+Suggested README.md details
+Name: A. Siva Shankar
+Register Number: 192573026
+Course: CSA0417 – Operating Systems
+Assignment: CO2 Assignment 2
+Compiler: gcc <record the installed version>
+Operating System: <record Linux distribution and version>
+ 
+Compile examples:
+gcc -std=c11 -Wall -Wextra fork_demo.c -o fork_demo
+gcc -std=c11 -Wall -Wextra rr.c -o rr
+gcc -std=c11 -Wall -Wextra -pthread camera_pool.c -o camera_pool
+gcc -std=c11 -Wall -Wextra pipe_weather.c -o pipe_weather
+gcc -std=c11 -Wall -Wextra -pthread bounded_buffer.c -o bounded_buffer
+gcc -std=c11 -Wall -Wextra banker.c -o banker
+ 
+For each task:
+- Purpose
+- Exact compile command
+- Exact run command
+- Actual output / screenshot
+- Short result and evaluation
+
+End of Assignment 2 – CO2
